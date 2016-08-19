@@ -1,0 +1,256 @@
+﻿#region using directives
+
+using System;
+using System.Globalization;
+using System.IO;
+using System.Net;
+using System.Reflection;
+using System.Threading;
+using Cv3PKM.Bot.CLI.Resources;
+using Cv3PKM.Bot.Logic;
+using Cv3PKM.Bot.Logic.Common;
+using Cv3PKM.Bot.Logic.Event;
+using Cv3PKM.Bot.Logic.Logging;
+using Cv3PKM.Bot.Logic.State;
+using Cv3PKM.Bot.Logic.Tasks;
+using Cv3PKM.Bot.Logic.Utils;
+
+#endregion
+
+namespace Cv3PKM.Bot.CLI
+{
+    internal class Program
+    {
+        private static readonly ManualResetEvent QuitEvent = new ManualResetEvent(false);
+        private static string subPath = "";
+        private static Uri strKillSwitchUri = new Uri("https://www.cv3app.com/Cv3PKM/KillSwitch.txt");
+
+        private static void Main(string[] args)
+        {
+
+            string strCulture = Thread.CurrentThread.CurrentCulture.TwoLetterISOLanguageName;
+
+            var culture = CultureInfo.CreateSpecificCulture( "th" );
+            CultureInfo.DefaultThreadCurrentCulture = culture;
+            Thread.CurrentThread.CurrentCulture = culture;
+
+            AppDomain.CurrentDomain.UnhandledException += UnhandledExceptionEventHandler;
+
+            Console.Title = "Cv3PKM";
+            Console.CancelKeyPress += (sender, eArgs) =>
+            {
+                QuitEvent.Set();
+                eArgs.Cancel = true;
+            };
+            if (args.Length > 0)
+                subPath = args[0];
+
+            Logger.SetLogger(new ConsoleLogger(LogLevel.LevelUp), subPath);
+
+            if (CheckKillSwitch())
+                return;
+
+            var profilePath = Path.Combine(Directory.GetCurrentDirectory(), subPath);
+            var profileConfigPath = Path.Combine(profilePath, "config");
+            var configFile = Path.Combine(profileConfigPath, "config.json");
+
+            GlobalSettings settings;
+            Boolean boolNeedsSetup = false;
+
+            if( File.Exists( configFile ) )
+            {
+                // Load the settings from the config file
+                // If the current program is not the latest version, ensure we skip saving the file after loading
+                // This is to prevent saving the file with new options at their default values so we can check for differences
+                settings = GlobalSettings.Load( subPath, !VersionCheckState.IsLatest() );
+            }
+            else
+            {
+                settings = new GlobalSettings();
+                settings.ProfilePath = profilePath;
+                settings.ProfileConfigPath = profileConfigPath;
+                settings.GeneralConfigPath = Path.Combine( Directory.GetCurrentDirectory(), "config" );
+                settings.ConsoleSettings.TranslationLanguageCode = strCulture;
+
+                boolNeedsSetup = true;
+            }
+
+            if (args.Length > 1)
+            {
+                string[] crds = args[1].Split(',');
+                double lat, lng;
+                try
+                {
+                    lat = Double.Parse(crds[0]);
+                    lng = Double.Parse(crds[1]);
+                    settings.LocationSettings.DefaultLatitude = lat;
+                    settings.LocationSettings.DefaultLongitude = lng;
+                }
+                catch (Exception) { }
+            }
+
+
+            var session = new Session(new ClientSettings(settings), new LogicSettings(settings));
+
+            if (boolNeedsSetup)
+            {
+                if (GlobalSettings.PromptForSetup(session.Translation))
+                {
+                    session = GlobalSettings.SetupSettings(session, settings, configFile);
+
+                    var fileName = Assembly.GetExecutingAssembly().Location;
+                    System.Diagnostics.Process.Start(fileName);
+                    Environment.Exit(0);
+                }
+                else
+                {
+                    GlobalSettings.Load(subPath);
+
+                    Logger.Write("กดคีย์ใดๆ เพื่อดำเนินการด่อ...",
+                        LogLevel.Warning);
+                    Console.ReadKey();
+                    return;
+                }
+
+            }
+
+            GlobalSettings.CheckGoogleAPI(session.Translation, settings);
+            ProgressBar.start("Cv3PKM กำลังเริ่มต้น...", 10);
+
+            session.Client.ApiFailure = new ApiFailureStrategy(session);
+            ProgressBar.fill(20);
+
+            /*SimpleSession session = new SimpleSession
+            {
+                _client = new Cv3PKM.RocketAPI.Client(new ClientSettings(settings)),
+                _dispatcher = new EventDispatcher(),
+                _localizer = new Localizer()
+            };
+
+            BotService service = new BotService
+            {
+                _session = session,
+                _loginTask = new Login(session)
+            };
+
+            service.Run();
+            */
+
+            var machine = new StateMachine();
+            var stats = new Statistics();
+
+            ProgressBar.fill(30);
+            string strVersion = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version.ToString(3);
+            stats.DirtyEvent +=
+                () =>
+                    Console.Title = $"[Cv3 v{strVersion}] " +
+                        stats.GetTemplatedStats(
+                            session.Translation.GetTranslation(TranslationString.StatsTemplateString),
+                            session.Translation.GetTranslation(TranslationString.StatsXpTemplateString));
+            ProgressBar.fill(40);
+
+            var aggregator = new StatisticsAggregator(stats);
+            ProgressBar.fill(50);
+            var listener = new ConsoleEventListener();
+            ProgressBar.fill(60);
+
+            session.EventDispatcher.EventReceived += evt => listener.Listen(evt, session);
+            session.EventDispatcher.EventReceived += evt => aggregator.Listen(evt, session);
+            if (settings.WebsocketsSettings.UseWebsocket)
+            {
+                var websocket = new WebSocketInterface(settings.WebsocketsSettings.WebSocketPort, session);
+                session.EventDispatcher.EventReceived += evt => websocket.Listen(evt, session);
+            }
+            
+            ProgressBar.fill(70);
+
+            machine.SetFailureState(new LoginState());
+            ProgressBar.fill(80);
+
+            Logger.SetLoggerContext(session);
+            ProgressBar.fill(90);
+
+            session.Navigation.UpdatePositionEvent +=
+                (lat, lng) => session.EventDispatcher.Send(new UpdatePositionEvent { Latitude = lat, Longitude = lng });
+            session.Navigation.UpdatePositionEvent += Navigation_UpdatePositionEvent;
+
+            ProgressBar.fill(100);
+            
+            machine.AsyncStart(new VersionCheckState(), session);
+
+            try
+            {
+                Console.Clear();
+            }
+            catch( IOException ) { }
+
+            if (settings.TelegramSettings.UseTelegramAPI)
+            {
+                session.Telegram = new Cv3PKM.Bot.Logic.Service.TelegramService(settings.TelegramSettings.TelegramAPIKey, session);
+            }
+
+            if (session.LogicSettings.UseSnipeLocationServer)
+                SnipePokemonTask.AsyncStart(session);
+
+            settings.checkProxy(session.Translation);
+
+            QuitEvent.WaitOne();
+        }
+
+        private static void Navigation_UpdatePositionEvent(double lat, double lng)
+        {
+            SaveLocationToDisk(lat, lng);
+        }
+
+        private static void SaveLocationToDisk(double lat, double lng)
+        {
+            var coordsPath = Path.Combine(Directory.GetCurrentDirectory(), subPath, "Config", "LastPos.ini");
+
+            File.WriteAllText(coordsPath, $"{lat}:{lng}");
+        }
+
+        private static bool CheckKillSwitch()
+        {
+            using (var wC = new WebClient())
+            {
+                try
+                {
+                    string strResponse = WebClientExtensions.DownloadString(wC, strKillSwitchUri);
+                        
+                    if( strResponse == null )
+                        return false;
+
+                    string[] strSplit = strResponse.Split(';');
+
+                    if (strSplit.Length > 1)
+                    {
+                        string strStatus = strSplit[0];
+                        string strReason = strSplit[1];
+
+                        if (strStatus.ToLower().Contains("disable"))
+                        {
+                            Console.WriteLine(strReason + "\n");
+
+                            Logger.Write("กำลังปิดบอท, กรุณากด Enter เพื่อดำเนินการต่อ", LogLevel.Error);
+                            Console.ReadLine();
+                            return true;
+                        }
+                    }
+                    else
+                        return false;
+                }
+                catch (WebException)
+                {
+                }
+            }
+
+            return false;
+        }
+
+        private static void UnhandledExceptionEventHandler(object obj, UnhandledExceptionEventArgs args)
+        {
+            Logger.Write("การดำเนินการผิดพลาด, กรุณาดูไฟล์ LogBuffer.", force: true);
+            throw new Exception();
+        }
+    }
+}
